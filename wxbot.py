@@ -85,6 +85,8 @@ class WXBot:
         self.sync_key = []
         self.sync_host = ''
 
+        status = 'wait4login'    #表示机器人状态，供WEBAPI读取，WxbotManage使用
+        bot_conf = {} #机器人配置，在webapi初始化的时候传入，后续也可修改，WxbotManage使用
 
         self.batch_count = 50    #一次拉取50个联系人的信息
         self.full_user_name_list = []    #直接获取不到通讯录时，获取的username列表
@@ -119,6 +121,21 @@ class WXBot:
 
         self.file_index = 0
 
+    #在未传入bot_conf的情况下尝试载入本地配置文件，WxbotManage使用
+    def load_conf(self,bot_conf):
+        try:
+            if bot_conf == {}:
+                with open(os.path.join(self.temp_pwd,'bot_conf.json')) as f:
+                    self.bot_conf= json.loads(f.read())
+        except:
+            self.bot_conf = {}
+
+    #保存配置文件，WxbotManage使用
+    def save_conf(self):
+        with open(os.path.join(self.temp_pwd,'bot_conf.json'), 'w') as f:
+            f.write(json.dumps(self.bot_conf))
+
+
     @staticmethod
     def to_unicode(string, encoding='utf-8'):
         """
@@ -136,23 +153,35 @@ class WXBot:
 
     def get_contact(self):
         """获取当前账户的所有相关账号(包括联系人、公众号、群聊、特殊账号)"""
-        if self.is_big_contact:
-            return False
-        url = self.base_uri + '/webwxgetcontact?pass_ticket=%s&skey=%s&r=%s' \
+        dic_list = []
+        url = self.base_uri + '/webwxgetcontact?seq=0&pass_ticket=%s&skey=%s&r=%s' \
                               % (self.pass_ticket, self.skey, int(time.time()))
 
         #如果通讯录联系人过多，这里会直接获取失败
         try:
-            r = self.session.post(url, data='{}')
+            r = self.session.post(url, data='{}', timeout=180)
         except Exception as e:
-            self.is_big_contact = True
             return False
         r.encoding = 'utf-8'
+        dic = json.loads(r.text)
+        dic_list.append(dic)
+
+        while int(dic["Seq"]) != 0:
+            print "[INFO] Geting contacts. Get %s contacts for now" % dic["MemberCount"]
+            url = self.base_uri + '/webwxgetcontact?seq=%s&pass_ticket=%s&skey=%s&r=%s' \
+                      % (dic["Seq"], self.pass_ticket, self.skey, int(time.time()))
+            r = self.session.post(url, data='{}', timeout=180)
+            r.encoding = 'utf-8'
+            dic = json.loads(r.text)
+            dic_list.append(dic)
+
         if self.DEBUG:
             with open(os.path.join(self.temp_pwd,'contacts.json'), 'w') as f:
-                f.write(r.text.encode('utf-8'))
-        dic = json.loads(r.text)
-        self.member_list = dic['MemberList']
+                f.write(json.dumps(dic_list))
+
+        self.member_list = []
+        for dic in dic_list:
+            self.member_list.extend(dic['MemberList'])
 
         special_users = ['newsapp', 'fmessage', 'filehelper', 'weibo', 'qqmail',
                          'fmessage', 'tmessage', 'qmessage', 'qqsync', 'floatbottle',
@@ -681,7 +710,7 @@ class WXBot:
                     with open(os.path.join(self.temp_pwd,'wxid.txt'), 'w') as f:
                         f.write(json.dumps(self.wxid_list))
                     print "[INFO] Contact list is too big. Now start to fetch member list ."
-                    self.get_big_contact()
+                    #self.get_big_contact()
 
             elif msg['MsgType'] == 37:  # friend request
                 msg_type_id = 37
@@ -738,7 +767,10 @@ class WXBot:
 
     def proc_msg(self):
         self.test_sync_check()
+        self.status = 'loginsuccess'  #WxbotManage使用
         while True:
+            if self.status == 'wait4loginout':  #WxbotManage使用
+                return 
             check_time = time.time()
             try:
                 [retcode, selector] = self.sync_check()
@@ -859,17 +891,28 @@ class WXBot:
                 gid = group['UserName']
         if gid == '':
             return False
+        #获取群成员数量并判断邀请方式
+        group_num=len(self.group_members[gid])
+        print '[DEBUG] group_name:%s group_num:%s' % (group_name,group_num)
         #通过群id判断uid是否在群中
         for user in self.group_members[gid]:
             if user['UserName'] == uid:
                 #已经在群里面了,不用加了
                 return True
-        url = self.base_uri + '/webwxupdatechatroom?fun=addmember&pass_ticket=%s' % self.pass_ticket
-        params ={
-            "AddMemberList": uid,
-            "ChatRoomName": gid,
-            "BaseRequest": self.base_request
-        }
+        if group_num<=100:
+            url = self.base_uri + '/webwxupdatechatroom?fun=addmember&pass_ticket=%s' % self.pass_ticket
+            params ={
+                "AddMemberList": uid,
+                "ChatRoomName": gid,
+                "BaseRequest": self.base_request
+            }
+        else:
+            url = self.base_uri + '/webwxupdatechatroom?fun=invitemember'
+            params ={
+                "InviteMemberList": uid,
+                "ChatRoomName": gid,
+                "BaseRequest": self.base_request
+            }
         headers = {'content-type': 'application/json; charset=UTF-8'}
         data = json.dumps(params, ensure_ascii=False).encode('utf8')
         try:
@@ -1133,31 +1176,40 @@ class WXBot:
         return 'unknown'
 
     def run(self):
-        self.get_uuid()
-        self.gen_qr_code(os.path.join(self.temp_pwd,'wxqr.png'))
-        print '[INFO] Please use WeChat to scan the QR code .'
+        try:
+            self.get_uuid()
+            self.gen_qr_code(os.path.join(self.temp_pwd,'wxqr.png'))
+            print '[INFO] Please use WeChat to scan the QR code .'
 
-        result = self.wait4login()
-        if result != SUCCESS:
-            print '[ERROR] Web WeChat login failed. failed code=%s' % (result,)
-            return
+            result = self.wait4login()
+            if result != SUCCESS:
+                print '[ERROR] Web WeChat login failed. failed code=%s' % (result,)
+                self.status = 'loginout'
+                return
 
-        if self.login():
-            print '[INFO] Web WeChat login succeed .'
-        else:
-            print '[ERROR] Web WeChat login failed .'
-            return
+            if self.login():
+                print '[INFO] Web WeChat login succeed .'
+            else:
+                print '[ERROR] Web WeChat login failed .'
+                self.status = 'loginout'
+                return
 
-        if self.init():
-            print '[INFO] Web WeChat init succeed .'
-        else:
-            print '[INFO] Web WeChat init failed'
-            return
-        self.status_notify()
-        if self.get_contact():
-            print '[INFO] Get %d contacts' % len(self.contact_list)
-            print '[INFO] Start to process messages .'
-        self.proc_msg()
+            if self.init():
+                print '[INFO] Web WeChat init succeed .'
+            else:
+                print '[INFO] Web WeChat init failed'
+                self.status = 'loginout'
+                return
+            self.status_notify()
+            if self.get_contact():
+                print '[INFO] Get %d contacts' % len(self.contact_list)
+                print '[INFO] Start to process messages .'
+            self.proc_msg()
+            self.status = 'loginout'
+        except Exception,e:
+            print '[ERROR] Web WeChat run failed --> %s'%(e)
+            self.status = 'loginout'
+
 
     def get_uuid(self):
         url = 'https://login.weixin.qq.com/jslogin'
@@ -1350,7 +1402,7 @@ class WXBot:
             r.encoding = 'utf-8'
             dic = json.loads(r.text)
             if dic['BaseResponse']['Ret'] == 0:
-                self.sync_key = dic['SyncKey']
+                self.sync_key = dic['SyncCheckKey']
                 self.sync_key_str = '|'.join([str(keyVal['Key']) + '_' + str(keyVal['Val'])
                                               for keyVal in self.sync_key['List']])
             return dic
